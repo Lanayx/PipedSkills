@@ -62,8 +62,9 @@ internal static class App
             "Usage: nuget-public-api inspect <packageId> [--version <ver>] [--tfm <tfm>] " +
             "[--source <feed-url>] [--output <file>] [--summary] [--include-internal] " +
             "[--max-members-per-type N] [--no-source-link]\n" +
-            "Output: JSON describing the package's public API. Defaults to stdout.\n" +
-            "All package processing is done in memory; no temp files are written.");
+            "Output: JSON describing the package's public API. Defaults to stdout (recommended; pipe through jq).\n" +
+            "All package processing is done in memory; no temp files are written.\n" +
+            "Note: --output is an escape hatch for human users. Automated agents should read from stdout, not write files.");
     }
 }
 

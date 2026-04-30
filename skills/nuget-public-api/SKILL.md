@@ -30,7 +30,7 @@ Do NOT use this skill for:
 
 ## How to invoke
 
-Run from the repository root (paths are relative). Always prefer writing JSON to a file rather than stdout (output can be large):
+Run from the repository root (paths are relative). Output is JSON on stdout by default — read it directly from the process; do NOT write it to a temp file:
 
 ```bash
 dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
@@ -47,19 +47,22 @@ The first run downloads/restores the script's NuGet dependencies into a per-scri
 
 ### Recommended invocation pattern for agents
 
-1. Start with `--summary` to get a small map of namespaces and types.
-2. Read the summary, identify the relevant types/namespaces.
-3. Re-run without `--summary` (full mode) and `grep`/parse the section for those types only.
+1. Start with `--summary` to get a small map of namespaces and types. Read it directly from stdout.
+2. From the summary, identify the relevant types/namespaces.
+3. Re-run without `--summary` (full mode) and pipe through `jq` / `grep` to extract only the sections you need.
 
 ```bash
-# Step 1: lightweight overview (~tens of KB even for large packages)
+# Step 1: lightweight overview (~tens of KB even for large packages) — read from stdout
 dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
-  inspect Polly --summary --output /tmp/polly-summary.json
+  inspect Polly --summary
 
-# Step 2: full API for member-level questions
+# Step 2: full API, filtered to one type — pipe through jq, no temp file needed
 dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
-  inspect Polly --output /tmp/polly-full.json
+  inspect Polly \
+  | jq '.assemblies[].namespaces[].types[] | select(.name == "Polly.ResiliencePipelineBuilder")'
 ```
+
+> **Do not write the output to `/tmp/*.json`, `~/...`, or any other on-disk path unless the user explicitly asked for a file.** The tool was designed so the agent reads results straight from the process's stdout. `--output <file>` exists only as an escape hatch for human users who want to persist a snapshot or for shells that cannot capture multi-megabyte stdout reliably; agents should not use it.
 
 ## Arguments
 
@@ -69,7 +72,7 @@ dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
 | `--version <ver>` | latest stable | Exact version (`8.4.2`), prefix (`8`, `8.4` — picks highest matching, prefers stable, falls back to prerelease), or NuGet range (`[8.0,9.0)`). Without it: latest stable, falling back to latest prerelease. |
 | `--tfm <tfm>` | best match | Target framework short name (e.g. `net10.0`, `net8.0`, `netstandard2.0`). If exact TFM is missing, the nearest compatible group is selected and surfaced in `targetFrameworkSubstituted`. |
 | `--summary` | off | Emit only namespaces + type names + type-level XML doc summaries. ~10–50× smaller. |
-| `--output <file>` | stdout | Write JSON to a file. Strongly recommended for large packages. |
+| `--output <file>` | stdout | **Agents: do not use.** Write JSON to a file. Intended for human users only; agents should read JSON from stdout and pipe through `jq`. |
 | `--include-internal` | off | Include `internal`/`private protected`/`internal protected` members. Default is public + protected only. |
 | `--max-members-per-type N` | 0 (unlimited) | Cap members per type to keep output bounded. |
 | `--no-source-link` | off | Skip PDB/Source Link probing. Use when the package has no PDB or you do not need source URLs. |
