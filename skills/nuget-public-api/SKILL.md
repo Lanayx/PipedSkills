@@ -36,12 +36,14 @@ Run from the repository root (paths are relative). Always prefer writing JSON to
 dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
   inspect <PackageId> [--version <ver-or-prefix-or-range>] [--tfm <tfm>] [--summary] \
   [--output <file>] [--include-internal] [--max-members-per-type N] \
-  [--no-source-link] [--source <feed-url>] [--cache-dir <dir>]
+  [--no-source-link] [--source <feed-url>]
 ```
 
 Exit codes: `0` = success, `1` = bad CLI args, `2` = unhandled exception (message on stderr).
 
-The first run downloads/restores the referenced packages into a per-script cache and is slow (~10–30s). Subsequent runs are fast.
+All package processing is done in memory: nupkgs are downloaded into RAM, assemblies are loaded via `MetadataLoadContext.LoadFromByteArray`, and no temp files are written for inspected package data. (The `dotnet run` build cache for the script itself still lives under the user's home directory; that is unrelated to the inspected package.)
+
+The first run downloads/restores the script's NuGet dependencies into a per-script build cache and is slow (~10–30s). Subsequent runs are fast.
 
 ### Recommended invocation pattern for agents
 
@@ -72,7 +74,6 @@ dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
 | `--max-members-per-type N` | 0 (unlimited) | Cap members per type to keep output bounded. |
 | `--no-source-link` | off | Skip PDB/Source Link probing. Use when the package has no PDB or you do not need source URLs. |
 | `--source <url>` | nuget.org v3 | Alternative feed (private feed must be open or auth-prepared by NuGet config). |
-| `--cache-dir <dir>` | `${TMP}/nuget-public-api-skill` | Local cache for downloaded `.nupkg` and extracts. |
 
 ## Output schema (JSON)
 

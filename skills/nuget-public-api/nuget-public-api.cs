@@ -1,5 +1,5 @@
-﻿#:package NuGet.Protocol@6.12.1
-#:package System.Reflection.MetadataLoadContext@9.0.0
+﻿#:package NuGet.Protocol@7.3.1
+#:package System.Reflection.MetadataLoadContext@10.0.7
 #:property JsonSerializerIsReflectionEnabledByDefault=true
 #:property PublishAot=false
 
@@ -61,8 +61,9 @@ internal static class App
         Console.Error.WriteLine(
             "Usage: nuget-public-api inspect <packageId> [--version <ver>] [--tfm <tfm>] " +
             "[--source <feed-url>] [--output <file>] [--summary] [--include-internal] " +
-            "[--max-members-per-type N] [--no-source-link] [--cache-dir <dir>]\n" +
-            "Output: JSON describing the package's public API. Defaults to stdout.");
+            "[--max-members-per-type N] [--no-source-link]\n" +
+            "Output: JSON describing the package's public API. Defaults to stdout.\n" +
+            "All package processing is done in memory; no temp files are written.");
     }
 }
 
@@ -76,7 +77,6 @@ internal sealed record CliArgs(
     bool IncludeInternal,
     int MaxMembersPerType,
     bool NoSourceLink,
-    string CacheDir,
     bool SummaryOnly)
 {
     public static CliArgs? Parse(string[] args)
@@ -92,7 +92,6 @@ internal sealed record CliArgs(
         bool includeInternal = false;
         int maxMembers = 0;
         bool noSourceLink = false;
-        string cacheDir = Path.Combine(Path.GetTempPath(), "nuget-public-api-skill");
         bool summaryOnly = false;
 
         for (int i = 2; i < args.Length; i++)
@@ -106,7 +105,6 @@ internal sealed record CliArgs(
                 case "--include-internal": includeInternal = true; break;
                 case "--max-members-per-type": maxMembers = int.Parse(args[++i]); break;
                 case "--no-source-link": noSourceLink = true; break;
-                case "--cache-dir": cacheDir = args[++i]; break;
                 case "--summary": summaryOnly = true; break;
                 default:
                     Console.Error.WriteLine("Unknown arg: " + args[i]);
@@ -115,23 +113,24 @@ internal sealed record CliArgs(
         }
 
         return new CliArgs(cmd, packageId, version, tfm, source, output,
-            includeInternal, maxMembers, noSourceLink, cacheDir, summaryOnly);
+            includeInternal, maxMembers, noSourceLink, summaryOnly);
     }
 }
+
+internal sealed record InMemoryAssembly(string Key, byte[] Dll, byte[]? Xml);
 
 internal static class Inspector
 {
     public static async Task<object> InspectAsync(CliArgs args)
     {
-        Directory.CreateDirectory(args.CacheDir);
-
         var logger = NullLogger.Instance;
         var ct = CancellationToken.None;
 
         var sourceRepo = Repository.Factory.GetCoreV3(args.Source);
         var findResource = await sourceRepo.GetResourceAsync<FindPackageByIdResource>(ct);
 
-        var sourceCacheContext = new SourceCacheContext();
+        // NoCache + DirectDownload prevents NuGet from writing to its HTTP cache directory.
+        var sourceCacheContext = new SourceCacheContext { NoCache = true, DirectDownload = true };
 
         // Resolve version
         var allVersions = (await findResource.GetAllVersionsAsync(args.PackageId, sourceCacheContext, logger, ct)).ToList();
@@ -139,33 +138,10 @@ internal static class Inspector
 
         NuGetVersion version = ResolveVersion(args.Version, allVersions);
 
-        // Download nupkg
-        var nupkgPath = Path.Combine(args.CacheDir, $"{args.PackageId}.{version}.nupkg");
-        if (!File.Exists(nupkgPath))
-        {
-            using var stream = File.Create(nupkgPath);
-            var ok = await findResource.CopyNupkgToStreamAsync(args.PackageId, version, stream, sourceCacheContext, logger, ct);
-            if (!ok) throw new Exception($"Failed to download {args.PackageId} {version}");
-        }
+        // Download nupkg into memory
+        var nupkgBytes = await DownloadNupkgAsync(findResource, args.PackageId, version, sourceCacheContext, logger, ct);
 
-        // Extract package
-        var extractDir = Path.Combine(args.CacheDir, $"{args.PackageId}.{version}");
-        if (!Directory.Exists(extractDir))
-        {
-            Directory.CreateDirectory(extractDir);
-            using var pkg = new PackageArchiveReader(File.OpenRead(nupkgPath));
-            foreach (var f in await pkg.GetFilesAsync(ct))
-            {
-                var dest = SafeCombine(extractDir, f);
-                if (dest is null) continue;
-                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                using var src = pkg.GetStream(f);
-                using var dst = File.Create(dest);
-                await src.CopyToAsync(dst, ct);
-            }
-        }
-
-        using var packageReader = new PackageArchiveReader(File.OpenRead(nupkgPath));
+        using var packageReader = new PackageArchiveReader(new MemoryStream(nupkgBytes, writable: false));
         var nuspec = packageReader.NuspecReader;
 
         // Pick TFM and assembly group: prefer ref/, fallback lib/
@@ -204,17 +180,21 @@ internal static class Inspector
         }
         else
         {
-            // Prefer net10/net9/net8/netstandard2.1/netstandard2.0, then highest .NET, then first
             chosenGroup = PickBestFramework(groupSource);
         }
 
-        var assemblies = chosenGroup.Items
-            .Where(i => i.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-            .Select(i => Path.Combine(extractDir, i.Replace('/', Path.DirectorySeparatorChar)))
-            .Where(File.Exists)
-            .ToList();
+        // Load primary assemblies into memory (DLL + matching XML)
+        var primaryAssemblies = new List<InMemoryAssembly>();
+        foreach (var entry in chosenGroup.Items.Where(i => i.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+        {
+            var dll = await ReadEntryBytesAsync(packageReader, entry, ct);
+            if (dll is null) continue;
+            var xmlEntry = Path.ChangeExtension(entry, ".xml").Replace('\\', '/');
+            var xml = await ReadEntryBytesAsync(packageReader, xmlEntry, ct);
+            primaryAssemblies.Add(new InMemoryAssembly(Path.GetFileName(entry), dll, xml));
+        }
 
-        if (assemblies.Count == 0)
+        if (primaryAssemblies.Count == 0)
         {
             return new
             {
@@ -223,46 +203,46 @@ internal static class Inspector
             };
         }
 
-        // Resolve dependency assemblies for MetadataLoadContext (lightweight: only needed for type resolution)
-        var dependencyDlls = await ResolveDependencyAssembliesAsync(
-            packageReader, chosenGroup.TargetFramework, args, sourceRepo, sourceCacheContext, logger, ct);
+        // Walk dependency graph in memory (best-effort)
+        var dependencyAssemblies = await ResolveDependencyAssembliesAsync(
+            packageReader, chosenGroup.TargetFramework, sourceRepo, sourceCacheContext, logger, ct);
 
         // Source Link map (best effort, per assembly)
         var sourceLinkMaps = new Dictionary<string, SourceLinkInfo?>();
         if (!args.NoSourceLink)
         {
-            foreach (var asm in assemblies)
-            {
-                sourceLinkMaps[asm] = SourceLinkReader.TryRead(asm);
-            }
+            foreach (var asm in primaryAssemblies)
+                sourceLinkMaps[asm.Key] = SourceLinkReader.TryRead(asm.Dll);
         }
+
+        // Build in-memory MetadataLoadContext
+        var inMemoryByName = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var a in primaryAssemblies)
+            inMemoryByName[Path.GetFileNameWithoutExtension(a.Key)] = a.Dll;
+        foreach (var a in dependencyAssemblies)
+            inMemoryByName.TryAdd(Path.GetFileNameWithoutExtension(a.Key), a.Dll);
+
+        var runtimeRefs = GetRuntimeRefAssemblies();
+        var resolver = new InMemoryAssemblyResolver(inMemoryByName, runtimeRefs);
+        var coreAssemblyName = GetCoreAssemblyName(runtimeRefs);
+        using var mlc = new MetadataLoadContext(resolver, coreAssemblyName);
 
         // Inspect assemblies via MetadataLoadContext
         var apiAssemblies = new List<object>();
-
-        var resolverPaths = new List<string>(assemblies);
-        resolverPaths.AddRange(dependencyDlls);
-        // Add common runtime ref assemblies
-        resolverPaths.AddRange(GetRuntimeRefAssemblies());
-
-        var resolver = new PathAssemblyResolver(resolverPaths.Distinct().ToList());
-        using var mlc = new MetadataLoadContext(resolver, GetCoreAssemblyName(resolverPaths));
-
-        foreach (var asmPath in assemblies)
+        foreach (var primary in primaryAssemblies)
         {
-            var xmlPath = Path.ChangeExtension(asmPath, ".xml");
-            var xmlDocs = XmlDocs.Load(File.Exists(xmlPath) ? xmlPath : null);
+            var xmlDocs = XmlDocs.Load(primary.Xml);
 
             Assembly asm;
-            try { asm = mlc.LoadFromAssemblyPath(asmPath); }
+            try { asm = mlc.LoadFromByteArray(primary.Dll); }
             catch (Exception ex)
             {
-                apiAssemblies.Add(new { file = Path.GetFileName(asmPath), error = ex.Message });
+                apiAssemblies.Add(new { file = primary.Key, error = ex.Message });
                 continue;
             }
 
-            var sourceLink = sourceLinkMaps.GetValueOrDefault(asmPath);
-            var asmModel = ApiExtractor.Extract(asm, xmlDocs, args, sourceLink);
+            var sourceLink = sourceLinkMaps.GetValueOrDefault(primary.Key);
+            var asmModel = ApiExtractor.Extract(asm, xmlDocs, args, sourceLink, primary.Key);
             apiAssemblies.Add(asmModel);
         }
 
@@ -298,24 +278,38 @@ internal static class Inspector
             {
                 apiSource = refGroups.Count > 0 ? "ref/" : "lib/",
                 sourceLinkAvailable = sourceLinkMaps.Values.Any(v => v is not null),
-                hint = "Public API extracted from compiled assembly metadata. Source Link URLs (when present) point to exact source at the build commit.",
+                hint = "Public API extracted from compiled assembly metadata. All work is performed in memory; no temp files written.",
             }
         };
     }
 
-    private static string? SafeCombine(string root, string entry)
+    private static async Task<byte[]> DownloadNupkgAsync(
+        FindPackageByIdResource findResource,
+        string id,
+        NuGetVersion version,
+        SourceCacheContext cache,
+        ILogger logger,
+        CancellationToken ct)
     {
-        // Reject absolute paths, drive letters, and traversal segments
-        var normalized = entry.Replace('\\', '/');
-        if (normalized.StartsWith("/") || normalized.Length >= 2 && normalized[1] == ':')
+        using var ms = new MemoryStream();
+        var ok = await findResource.CopyNupkgToStreamAsync(id, version, ms, cache, logger, ct);
+        if (!ok) throw new Exception($"Failed to download {id} {version}");
+        return ms.ToArray();
+    }
+
+    private static async Task<byte[]?> ReadEntryBytesAsync(PackageArchiveReader pkg, string entry, CancellationToken ct)
+    {
+        try
+        {
+            using var src = pkg.GetStream(entry);
+            using var ms = new MemoryStream();
+            await src.CopyToAsync(ms, ct);
+            return ms.ToArray();
+        }
+        catch
+        {
             return null;
-        if (normalized.Split('/').Any(seg => seg == ".."))
-            return null;
-        var combined = Path.GetFullPath(Path.Combine(root, normalized.Replace('/', Path.DirectorySeparatorChar)));
-        var rootFull = Path.GetFullPath(root) + Path.DirectorySeparatorChar;
-        if (!combined.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
-            return null;
-        return combined;
+        }
     }
 
     private static NuGetVersion ResolveVersion(string? requested, List<NuGetVersion> all)
@@ -377,16 +371,15 @@ internal static class Inspector
         return groups.OrderByDescending(g => g.TargetFramework.Version).First();
     }
 
-    private static async Task<List<string>> ResolveDependencyAssembliesAsync(
+    private static async Task<List<InMemoryAssembly>> ResolveDependencyAssembliesAsync(
         PackageArchiveReader rootPkg,
         NuGetFramework tfm,
-        CliArgs args,
         SourceRepository sourceRepo,
         SourceCacheContext cache,
         ILogger logger,
         CancellationToken ct)
     {
-        var result = new List<string>();
+        var result = new List<InMemoryAssembly>();
         var depGroups = rootPkg.NuspecReader.GetDependencyGroups().ToList();
         var nearest = NuGetFrameworkUtility.GetNearest(depGroups, tfm, g => g.TargetFramework);
         if (nearest is null) return result;
@@ -403,31 +396,8 @@ internal static class Inspector
                 var best = range.FindBestMatch(versions);
                 if (best is null) return;
 
-                var depNupkg = Path.Combine(args.CacheDir, $"{id}.{best}.nupkg");
-                if (!File.Exists(depNupkg))
-                {
-                    using var s = File.Create(depNupkg);
-                    await findResource.CopyNupkgToStreamAsync(id, best, s, cache, logger, ct);
-                }
-                var extract = Path.Combine(args.CacheDir, $"{id}.{best}");
-                using var pkg = new PackageArchiveReader(File.OpenRead(depNupkg));
-
-                if (!Directory.Exists(extract))
-                {
-                    Directory.CreateDirectory(extract);
-                    foreach (var f in await pkg.GetFilesAsync(ct))
-                    {
-                        if (!f.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
-                            !f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        var dest = SafeCombine(extract, f);
-                        if (dest is null) continue;
-                        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                        using var src = pkg.GetStream(f);
-                        using var dst = File.Create(dest);
-                        await src.CopyToAsync(dst, ct);
-                    }
-                }
+                var nupkgBytes = await DownloadNupkgAsync(findResource, id, best, cache, logger, ct);
+                using var pkg = new PackageArchiveReader(new MemoryStream(nupkgBytes, writable: false));
 
                 var refItems = (await pkg.GetReferenceItemsAsync(ct)).ToList();
                 var libItems = (await pkg.GetLibItemsAsync(ct)).ToList();
@@ -435,10 +405,13 @@ internal static class Inspector
                 var grp = NuGetFrameworkUtility.GetNearest(src2, tfm, g => g.TargetFramework);
                 if (grp is not null)
                 {
-                    foreach (var i in grp.Items.Where(x => x.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+                    foreach (var entry in grp.Items.Where(x => x.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
                     {
-                        var p = Path.Combine(extract, i.Replace('/', Path.DirectorySeparatorChar));
-                        if (File.Exists(p)) result.Add(p);
+                        var dll = await ReadEntryBytesAsync(pkg, entry, ct);
+                        if (dll is null) continue;
+                        var xmlEntry = Path.ChangeExtension(entry, ".xml").Replace('\\', '/');
+                        var xml = await ReadEntryBytesAsync(pkg, xmlEntry, ct);
+                        result.Add(new InMemoryAssembly(Path.GetFileName(entry), dll, xml));
                     }
                 }
 
@@ -482,9 +455,45 @@ internal static class Inspector
     }
 }
 
+/// <summary>
+/// Resolves assemblies for MetadataLoadContext from an in-memory dictionary first,
+/// then falls back to the running runtime's reference assemblies (TPA) by file path.
+/// </summary>
+internal sealed class InMemoryAssemblyResolver : MetadataAssemblyResolver
+{
+    private readonly Dictionary<string, byte[]> _byName;
+    private readonly Dictionary<string, string> _runtimePathsByName;
+
+    public InMemoryAssemblyResolver(Dictionary<string, byte[]> byName, IEnumerable<string> runtimePaths)
+    {
+        _byName = byName;
+        _runtimePathsByName = new(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in runtimePaths)
+        {
+            var simple = Path.GetFileNameWithoutExtension(p);
+            if (!_runtimePathsByName.ContainsKey(simple))
+                _runtimePathsByName[simple] = p;
+        }
+    }
+
+    public override Assembly? Resolve(MetadataLoadContext context, AssemblyName assemblyName)
+    {
+        var name = assemblyName.Name;
+        if (string.IsNullOrEmpty(name)) return null;
+
+        if (_byName.TryGetValue(name, out var bytes))
+            return context.LoadFromByteArray(bytes);
+
+        if (_runtimePathsByName.TryGetValue(name, out var path))
+            return context.LoadFromAssemblyPath(path);
+
+        return null;
+    }
+}
+
 internal static class ApiExtractor
 {
-    public static object Extract(Assembly asm, XmlDocs docs, CliArgs args, SourceLinkInfo? sourceLink)
+    public static object Extract(Assembly asm, XmlDocs docs, CliArgs args, SourceLinkInfo? sourceLink, string fileName)
     {
         Type[] allTypes;
         try { allTypes = asm.GetTypes(); }
@@ -514,7 +523,7 @@ internal static class ApiExtractor
 
         return new
         {
-            file = Path.GetFileName(asm.Location),
+            file = fileName,
             assemblyName = asm.GetName().Name,
             assemblyVersion = asm.GetName().Version?.ToString(),
             sourceLink = sourceLink is null ? null : new
@@ -806,13 +815,14 @@ internal sealed class XmlDocs
     private readonly Dictionary<string, string> _map = new(StringComparer.Ordinal);
     private XmlDocs() { }
 
-    public static XmlDocs Load(string? path)
+    public static XmlDocs Load(byte[]? xmlBytes)
     {
         var d = new XmlDocs();
-        if (path is null || !File.Exists(path)) return d;
+        if (xmlBytes is null || xmlBytes.Length == 0) return d;
         try
         {
-            var doc = XDocument.Load(path);
+            using var ms = new MemoryStream(xmlBytes, writable: false);
+            var doc = XDocument.Load(ms);
             foreach (var m in doc.Descendants("member"))
             {
                 var name = m.Attribute("name")?.Value;
@@ -948,14 +958,14 @@ internal static class NullabilityHelper
 
 internal static class SourceLinkReader
 {
-    public static SourceLinkInfo? TryRead(string assemblyPath)
+    public static SourceLinkInfo? TryRead(byte[] peBytes)
     {
         try
         {
-            using var peStream = File.OpenRead(assemblyPath);
+            using var peStream = new MemoryStream(peBytes, writable: false);
             using var peReader = new PEReader(peStream);
 
-            // Try embedded PDB
+            // Try embedded PDB only (side-by-side .pdb files are not packaged in nupkgs).
             foreach (var entry in peReader.ReadDebugDirectory())
             {
                 if (entry.Type == DebugDirectoryEntryType.EmbeddedPortablePdb)
@@ -963,15 +973,6 @@ internal static class SourceLinkReader
                     using var prov = peReader.ReadEmbeddedPortablePdbDebugDirectoryData(entry);
                     return ReadFromPdb(prov.GetMetadataReader());
                 }
-            }
-
-            // Try side-by-side .pdb
-            var pdb = Path.ChangeExtension(assemblyPath, ".pdb");
-            if (File.Exists(pdb))
-            {
-                using var pdbStream = File.OpenRead(pdb);
-                using var prov = MetadataReaderProvider.FromPortablePdbStream(pdbStream);
-                return ReadFromPdb(prov.GetMetadataReader());
             }
         }
         catch { }
