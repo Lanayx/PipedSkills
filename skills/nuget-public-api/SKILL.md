@@ -26,14 +26,14 @@ Do NOT use this skill for:
 
 ## Tool location
 
-`skills/nuget-public-api/nuget-public-api.cs` — a single-file C# 14 / .NET 10 file-based app (no `.csproj`). NuGet dependencies are declared inline via `#:package` directives.
+`nuget-public-api.cs` in this skill directory — a single-file C# 14 / .NET 10 file-based app (no `.csproj`). NuGet dependencies are declared inline via `#:package` directives.
 
 ## How to invoke
 
-Run from the repository root (paths are relative). Output is JSON on stdout by default — read it directly from the process; do NOT write it to a temp file:
+Run from the directory containing `nuget-public-api.cs`. Output is JSON on stdout by default — read it directly from the process; do NOT write it to a temp file:
 
 ```bash
-dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
+dotnet run nuget-public-api.cs -- \
   inspect <PackageId> [--version <ver-or-prefix-or-range>] [--tfm <tfm>] [--summary] \
   [--output <file>] [--include-internal] [--max-members-per-type N] \
   [--no-source-link] [--source <feed-url>]
@@ -53,11 +53,11 @@ The first run downloads/restores the script's NuGet dependencies into a per-scri
 
 ```bash
 # Step 1: lightweight overview (~tens of KB even for large packages) — read from stdout
-dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
+dotnet run nuget-public-api.cs -- \
   inspect Polly --summary
 
 # Step 2: full API for the package — agent parses the JSON directly from stdout
-dotnet run skills/nuget-public-api/nuget-public-api.cs -- \
+dotnet run nuget-public-api.cs -- \
   inspect Polly
 ```
 
