@@ -1,1 +1,1 @@
-Collection of skill that I find very helpful
+Collection of skills that I find helpful
