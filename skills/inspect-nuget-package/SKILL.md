@@ -28,6 +28,8 @@ Do NOT use this skill for:
 
 `inspect-nuget-package.cs` in this skill directory — a single-file C# 14 / .NET 10 file-based app (no `.csproj`). NuGet dependencies are declared inline via `#:package` directives.
 
+Keep the adjacent `Directory.Build.props` with the script. It isolates the tool from the host repository's `Directory.Build.props`, `Directory.Build.targets`, and `Directory.Packages.props`, so repository-wide package references and Central Package Management do not interfere with the script's inline dependencies.
+
 ## How to invoke
 
 Run from the directory containing `inspect-nuget-package.cs`. Output is JSON on stdout by default — read it directly from the process; do NOT write it to a temp file:
@@ -38,6 +40,8 @@ dotnet run inspect-nuget-package.cs -- \
   [--filter <regex>] [--output <file>] [--include-internal] [--max-members-per-type N] \
   [--no-source-link] [--source <feed-url>]
 ```
+
+Alternatively, pass the script's absolute path to run it from another working directory. Build imports are resolved relative to the script, so changing the working directory alone does not isolate it from repository settings.
 
 Exit codes: `0` = success, `1` = bad CLI args, `2` = unhandled exception (message on stderr).
 
@@ -230,6 +234,7 @@ Summaries come from the `<assembly>.xml` shipped next to the DLL.
 
 | Symptom in JSON | Meaning | Action |
 | --- | --- | --- |
+| Build fails before JSON with `NU1008` (inline package versions conflict with Central Package Management) or `NU1015` (unversioned repository package references) | Host repository build settings leaked into the standalone tool | Restore the adjacent `Directory.Build.props` from this skill. Changing the working directory does not fix this; disabling Central Package Management alone also leaves injected package references behind. |
 | Top-level `error: "No managed reference or lib assemblies..."` | Build/analyzer/content/native package | Stop; tell user the package has no managed public API. |
 | `assemblies[*].error` | File is not a managed assembly, or its metadata is corrupt | Try a different `--tfm`; otherwise report. |
 | `types[*].error` / `methods[*].error` | Single member could not be described | Use the rest of the API; for that member, fall back to repository source. |

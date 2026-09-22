@@ -1,0 +1,9 @@
+<Project>
+  <!-- Keep this standalone tool independent of the host repository's build settings.
+       MSBuild stops its Directory.Build.props search at this file. -->
+  <PropertyGroup>
+    <ImportDirectoryPackagesProps>false</ImportDirectoryPackagesProps>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+  </PropertyGroup>
+</Project>
